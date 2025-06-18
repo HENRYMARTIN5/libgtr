@@ -3,7 +3,7 @@ use std::{env, time::Duration, thread};
 use simple_logger;
 
 fn main() -> Result<(), GtrError> {
-    simple_logger::SimpleLogger::new().with_level(log::LevelFilter::Error).init().unwrap();
+    simple_logger::SimpleLogger::new().with_level(log::LevelFilter::Info).init().unwrap();
 
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
@@ -23,15 +23,21 @@ fn main() -> Result<(), GtrError> {
 
     println!("Press Ctrl+C to stop.");
     let start_time = std::time::Instant::now();
+    let mut packet_count = 0u64;
+    
     loop {
         match reader.try_recv_packet() {
             Ok(Some(packet)) => {
+                packet_count += 1;
+                let dropped = reader.dropped_count();
                 println!(
-                    "Received Packet: Counter={}, Time={}us, S1_OK={}, S1_CoG={}",
+                    "Packet #{}: Counter={}, Time={}us, S1_OK={}, S1_CoG={}, Dropped={}",
+                    packet_count,
                     packet.header.counter,
                     packet.header.time_us,
                     packet.status.s1_ok,
-                    packet.sensors[0].cog_value
+                    packet.sensors[0].cog_value,
+                    dropped
                 );
             }
             Ok(None) => {
@@ -53,6 +59,9 @@ fn main() -> Result<(), GtrError> {
         }
     }
 
+    let final_dropped = reader.dropped_count();
+    println!("Final stats: {} packets received, {} packets dropped", packet_count, final_dropped);
+    
     reader.stop()?;
     println!("Program finished.");
     Ok(())

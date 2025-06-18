@@ -106,7 +106,7 @@ checksum = "d8cfeafaffdbc32176b64fb251369d52ea9f0a8fbc6f8759edffef7b525d64bb"
 
 [[package]]
 name = "libgtr"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "byteorder",
  "crossbeam-channel",
