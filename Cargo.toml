@@ -1,6 +1,6 @@
 [package]
 name = "libgtr"
-version = "0.1.2"
+version = "0.2.0"
 edition = "2024"
 license = "MIT"
 description = "Crate for receiving data from the PhotonFirst GTR-1001 fiber interrogator."
@@ -10,9 +10,15 @@ keywords = ["fiber", "PhotonFirst", "hardware", "serial", "interrogator"]
 categories = ["embedded"]
 
 [dependencies]
-serialport = "4.2"
 byteorder = "1.4"
 thiserror = "2.0.12"
 crossbeam-channel = "0.5"
 log = "0.4"
 simple_logger = "5.0.0"
+csv = "1.3.1"
+ctrlc = "3.4.7"
+chrono = "0.4.41"
+
+[dependencies.libftd2xx]
+version = "0.33.1"
+features = ["static"]

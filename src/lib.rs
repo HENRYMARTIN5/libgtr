@@ -3,19 +3,66 @@
 //! This crate provides communication with the PhotonFirst GTR-1001 fiber optic sensing system interrogator ("Gator") over a serial port.
 //! It handles packet parsing, synchronization, and exposes a thread-safe API for receiving parsed data.
 //!
+//! ## *nix Notes
+//! 
+//! The FTDI driver is statically compiled into the library, so you do not need to install any additional drivers on Linux.
+//! 
+//! To access the FTDI USB device as a regular user on Linux you need to update the udev rules.
+//! 
+//! Create a file called `/etc/udev/rules.d/99-ftdi.rules` with:
+//! 
+//! ```rules
+//! SUBSYSTEM=="usb", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6001", MODE="0666"
+//! SUBSYSTEM=="usb", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6010", MODE="0666"
+//! SUBSYSTEM=="usb", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6011", MODE="0666"
+//! SUBSYSTEM=="usb", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6014", MODE="0666"
+//! SUBSYSTEM=="usb", ATTRS{idVendor}=="0403", ATTRS{idProduct}=="6015", MODE="0666"
+//! ```
+//! 
+//! Then, reload the rules:
+//! 
+//! ```bash
+//! sudo udevadm control --reload-rules
+//! sudo udevadm trigger
+//! ```
+//! 
+//! If you get an error `DEVICE_NOT_OPENED`, you may need to blacklist the `ftdi_sio` kernel module:
+//! 
+//! ```bash
+//! sudo rmmod ftdi_sio # temporary
+//! echo "blacklist ftdi_sio" | sudo tee /etc/modprobe.d/ftdi_sio.conf # permanent
+//! ```
 
 use byteorder::{BigEndian, ReadBytesExt};
-use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
-use log::{debug, error, info};
-use serialport::SerialPort;
-use std::io::{self, Cursor, Read};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, bounded};
+use libftd2xx::Ftdi;
+use libftd2xx::FtdiCommon;
+use log::{debug, error, info, warn};
+use std::io::{self, Cursor};
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc,
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use thiserror::Error;
+
+trait JoinTimeout {
+    fn join_timeout(self, timeout: Duration) -> std::thread::Result<std::thread::Result<()>>;
+}
+
+impl<T> JoinTimeout for JoinHandle<T> {
+    fn join_timeout(self, timeout: Duration) -> std::thread::Result<std::thread::Result<()>> {
+        let start = std::time::Instant::now();
+        while start.elapsed() < timeout {
+            if self.is_finished() {
+                return Ok(self.join().map(|_| ()));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        Err(Box::new(std::io::Error::new(std::io::ErrorKind::TimedOut, "Thread join timed out")))
+    }
+}
 
 const MAGIC_BYTES: &[u8; 4] = b"yoho";
 const HEADER_SIZE: usize = 16;
@@ -28,8 +75,8 @@ const PACKET_TOTAL_SIZE: usize = HEADER_SIZE + PACKET_PAYLOAD_SIZE;
 #[derive(Error, Debug)]
 /// Errors that can occur when communicating with the Gator.
 pub enum GtrError {
-    #[error("Serial port error: {0}")]
-    Serial(#[from] serialport::Error),
+    #[error("FTDI error: {0}")]
+    Ftdi(#[from] libftd2xx::FtStatus),
     #[error("I/O error: {0}")]
     Io(#[from] io::Error),
     #[error("Parse error: {0}")]
@@ -244,14 +291,38 @@ impl GtrPacket {
         let status = Status::from_bytes(&bytes[status_offset..status_offset + STATUS_SIZE])?;
 
         let mut sensors = [
-            Sensor { sens_ok: false, cog_value: 0 },
-            Sensor { sens_ok: false, cog_value: 0 },
-            Sensor { sens_ok: false, cog_value: 0 },
-            Sensor { sens_ok: false, cog_value: 0 },
-            Sensor { sens_ok: false, cog_value: 0 },
-            Sensor { sens_ok: false, cog_value: 0 },
-            Sensor { sens_ok: false, cog_value: 0 },
-            Sensor { sens_ok: false, cog_value: 0 },
+            Sensor {
+                sens_ok: false,
+                cog_value: 0,
+            },
+            Sensor {
+                sens_ok: false,
+                cog_value: 0,
+            },
+            Sensor {
+                sens_ok: false,
+                cog_value: 0,
+            },
+            Sensor {
+                sens_ok: false,
+                cog_value: 0,
+            },
+            Sensor {
+                sens_ok: false,
+                cog_value: 0,
+            },
+            Sensor {
+                sens_ok: false,
+                cog_value: 0,
+            },
+            Sensor {
+                sens_ok: false,
+                cog_value: 0,
+            },
+            Sensor {
+                sens_ok: false,
+                cog_value: 0,
+            },
         ];
 
         for i in 0..NUM_SENSORS {
@@ -282,7 +353,8 @@ impl GtrPacket {
                 && &bytes[offset..offset + MAGIC_BYTES.len()] == MAGIC_BYTES
             {
                 if offset + PACKET_TOTAL_SIZE <= bytes.len() {
-                    if let Ok(packet) = Self::from_bytes(&bytes[offset..offset + PACKET_TOTAL_SIZE]) {
+                    if let Ok(packet) = Self::from_bytes(&bytes[offset..offset + PACKET_TOTAL_SIZE])
+                    {
                         debug!("Recovered at offset {}", offset);
                         return Ok(packet);
                     }
@@ -314,7 +386,10 @@ impl GtrPacket {
             nr_sensors: 0,
         };
 
-        let mut sensors = core::array::from_fn(|_| Sensor { sens_ok: false, cog_value: 0 });
+        let mut sensors = core::array::from_fn(|_| Sensor {
+            sens_ok: false,
+            cog_value: 0,
+        });
         let mut sensor_candidates = Vec::new();
 
         // Strategy 2a: Try to find sensor data at expected locations with tolerance
@@ -324,7 +399,9 @@ impl GtrPacket {
 
             // Try exact position first
             if base_offset + SENSOR_SIZE <= bytes.len() {
-                if let Ok(sensor) = Sensor::from_bytes(&bytes[base_offset..base_offset + SENSOR_SIZE]) {
+                if let Ok(sensor) =
+                    Sensor::from_bytes(&bytes[base_offset..base_offset + SENSOR_SIZE])
+                {
                     if Self::is_sensor_data_plausible(&sensor) {
                         sensors[i] = sensor;
                         continue;
@@ -336,7 +413,9 @@ impl GtrPacket {
             for offset_adj in -5i32..=5i32 {
                 let adjusted_offset = (base_offset as i32 + offset_adj) as usize;
                 if adjusted_offset + SENSOR_SIZE <= bytes.len() {
-                    if let Ok(sensor) = Sensor::from_bytes(&bytes[adjusted_offset..adjusted_offset + SENSOR_SIZE]) {
+                    if let Ok(sensor) =
+                        Sensor::from_bytes(&bytes[adjusted_offset..adjusted_offset + SENSOR_SIZE])
+                    {
                         if Self::is_sensor_data_plausible(&sensor) {
                             sensors[i] = sensor;
                             break;
@@ -360,7 +439,10 @@ impl GtrPacket {
         for i in 0..NUM_SENSORS {
             if !sensors[i].sens_ok {
                 // Find best unused candidate
-                if let Some((pos, sensor)) = sensor_candidates.iter().find(|(pos, _)| !used_positions.contains(pos)) {
+                if let Some((pos, sensor)) = sensor_candidates
+                    .iter()
+                    .find(|(pos, _)| !used_positions.contains(pos))
+                {
                     sensors[i] = sensor.clone();
                     used_positions.insert(*pos);
                 }
@@ -373,7 +455,10 @@ impl GtrPacket {
 
             for start_pos in 0..bytes.len().saturating_sub(SENSOR_SIZE) {
                 if let Ok(sensor) = Sensor::from_bytes(&bytes[start_pos..start_pos + SENSOR_SIZE]) {
-                    let quality_score = Self::calculate_sensor_quality_score(&sensor, &bytes[start_pos..start_pos + SENSOR_SIZE]);
+                    let quality_score = Self::calculate_sensor_quality_score(
+                        &sensor,
+                        &bytes[start_pos..start_pos + SENSOR_SIZE],
+                    );
                     if quality_score > 0.0 {
                         scored_candidates.push((start_pos, sensor, quality_score));
                     }
@@ -381,7 +466,8 @@ impl GtrPacket {
             }
 
             // Sort by quality score descending
-            scored_candidates.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+            scored_candidates
+                .sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
 
             // Fill remaining empty slots with highest quality candidates
             let mut candidates_used = 0;
@@ -401,11 +487,18 @@ impl GtrPacket {
                 let mut sequential_sensors = Vec::new();
                 let mut valid_sequence = true;
 
-                for seq_idx in 0..std::cmp::min(NUM_SENSORS, (bytes.len() - start_pos) / SENSOR_SIZE) {
+                for seq_idx in
+                    0..std::cmp::min(NUM_SENSORS, (bytes.len() - start_pos) / SENSOR_SIZE)
+                {
                     let sensor_start = start_pos + seq_idx * SENSOR_SIZE;
                     if sensor_start + SENSOR_SIZE <= bytes.len() {
-                        if let Ok(sensor) = Sensor::from_bytes(&bytes[sensor_start..sensor_start + SENSOR_SIZE]) {
-                            let quality = Self::calculate_sensor_quality_score(&sensor, &bytes[sensor_start..sensor_start + SENSOR_SIZE]);
+                        if let Ok(sensor) =
+                            Sensor::from_bytes(&bytes[sensor_start..sensor_start + SENSOR_SIZE])
+                        {
+                            let quality = Self::calculate_sensor_quality_score(
+                                &sensor,
+                                &bytes[sensor_start..sensor_start + SENSOR_SIZE],
+                            );
                             if quality > 0.3 {
                                 sequential_sensors.push((seq_idx, sensor));
                             } else {
@@ -431,7 +524,10 @@ impl GtrPacket {
         }
 
         // Count recovered sensors
-        let recovered_count = sensors.iter().filter(|s| s.sens_ok || s.cog_value != 0).count();
+        let recovered_count = sensors
+            .iter()
+            .filter(|s| s.sens_ok || s.cog_value != 0)
+            .count();
 
         if recovered_count > 0 {
             debug!("Recovered {} sensors", recovered_count);
@@ -534,7 +630,7 @@ impl GtrPacket {
 /// Threaded serial port reader for the Gator.
 ///
 /// This struct spawns a background thread to read and parse packets from the serial port,
-/// delivering them via a channel. Use [`recv_packet`] or [`try_recv_packet`] to receive packets.
+/// delivering them via a channel. Use [`GtrSerialReader.recv_packet`] or [`GtrSerialReader.try_recv_packet`] to receive packets.
 pub struct GtrSerialReader {
     packet_rx: Receiver<GtrPacket>,
     stop_signal: Arc<AtomicBool>,
@@ -545,18 +641,13 @@ pub struct GtrSerialReader {
 impl GtrSerialReader {
     /// Open a serial port and start a background thread to read Gator packets.
     ///
-    /// # Arguments
-    /// * `port_name` - Serial port device path (e.g., "/dev/ttyUSB0")
-    /// * `baud_rate` - Baud rate (e.g., 115200)
-    ///
     /// # Errors
     /// Returns [`GtrError`] if the port cannot be opened.
-    pub fn new(port_name: &str, baud_rate: u32) -> Result<Self, GtrError> {
-        info!("Opening serial port: {} at {} baud", port_name, baud_rate);
-        let port = serialport::new(port_name, baud_rate)
-            .timeout(Duration::from_millis(1000))
-            .open()?;
-        info!("Serial port opened successfully.");
+    pub fn new() -> Result<Self, GtrError> {
+        let mut port = Ftdi::new()?;
+        let devinfo = port.device_info()?;
+        info!("Device information: {:?}", devinfo);
+        port.set_timeouts(Duration::from_millis(10), Duration::from_millis(10))?;
 
         let (packet_tx, packet_rx) = bounded(100);
         let stop_signal = Arc::new(AtomicBool::new(false));
@@ -575,9 +666,8 @@ impl GtrSerialReader {
             dropped_count,
         })
     }
-
     fn reader_loop(
-        mut port: Box<dyn SerialPort>,
+        mut port: Ftdi,
         packet_tx: Sender<GtrPacket>,
         stop_signal: Arc<AtomicBool>,
         dropped_count: Arc<AtomicU64>,
@@ -586,7 +676,6 @@ impl GtrSerialReader {
         let mut sync_buffer_idx = 0;
         let mut synced = false;
         let mut packet_buffer = [0u8; PACKET_TOTAL_SIZE];
-        let mut skip_bytes = 0;
         let mut resync_attempts = 0;
         let mut corruption_buffer = Vec::new();
 
@@ -596,7 +685,10 @@ impl GtrSerialReader {
             if !synced {
                 let mut byte_buf = [0u8; 1];
                 match port.read(&mut byte_buf) {
-                    Ok(0) => continue,
+                    Ok(0) => {
+                        thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
                     Ok(_) => {
                         let byte = byte_buf[0];
                         sync_buffer[sync_buffer_idx] = byte;
@@ -604,19 +696,23 @@ impl GtrSerialReader {
 
                         let mut current_potential_magic = [0u8; MAGIC_BYTES.len()];
                         for i in 0..MAGIC_BYTES.len() {
-                            current_potential_magic[i] = sync_buffer[(sync_buffer_idx + i) % MAGIC_BYTES.len()];
+                            current_potential_magic[i] =
+                                sync_buffer[(sync_buffer_idx + i) % MAGIC_BYTES.len()];
                         }
 
                         if current_potential_magic == *MAGIC_BYTES {
                             debug!("Synced");
                             synced = true;
                             resync_attempts = 0;
-                            packet_buffer[..MAGIC_BYTES.len()].copy_from_slice(&current_potential_magic);
+                            packet_buffer[..MAGIC_BYTES.len()]
+                                .copy_from_slice(&current_potential_magic);
                             sync_buffer_idx = 0;
 
                             // If we have corruption buffer data, try to recover from it
                             if !corruption_buffer.is_empty() {
-                                if let Ok(recovered_packet) = GtrPacket::from_bytes_with_error_correction(&corruption_buffer) {
+                                if let Ok(recovered_packet) =
+                                    GtrPacket::from_bytes_with_error_correction(&corruption_buffer)
+                                {
                                     let _ = packet_tx.send(recovered_packet);
                                 }
                                 corruption_buffer.clear();
@@ -630,14 +726,13 @@ impl GtrSerialReader {
                             }
                         }
                     }
-                    Err(e) if e.kind() == io::ErrorKind::TimedOut => continue,
                     Err(e) => {
                         error!("Serial error during sync: {}", e);
                         break;
                     }
                 }
             } else {
-                match port.read_exact(&mut packet_buffer[MAGIC_BYTES.len()..]) {
+                match port.read_all(&mut packet_buffer[MAGIC_BYTES.len()..]) {
                     Ok(_) => {
                         match GtrPacket::from_bytes(&packet_buffer) {
                             Ok(packet) => {
@@ -658,11 +753,13 @@ impl GtrSerialReader {
                                     Err(_) => {
                                         // Count as dropped packet
                                         dropped_count.fetch_add(1, Ordering::Relaxed);
-                                        
+
                                         // Try to find magic bytes within the packet for recovery
                                         let mut found_magic_at = None;
                                         for offset in 1..PACKET_TOTAL_SIZE - MAGIC_BYTES.len() {
-                                            if &packet_buffer[offset..offset + MAGIC_BYTES.len()] == MAGIC_BYTES {
+                                            if &packet_buffer[offset..offset + MAGIC_BYTES.len()]
+                                                == MAGIC_BYTES
+                                            {
                                                 found_magic_at = Some(offset);
                                                 break;
                                             }
@@ -670,10 +767,13 @@ impl GtrSerialReader {
 
                                         if let Some(offset) = found_magic_at {
                                             // Add corrupted portion to corruption buffer for potential recovery
-                                            corruption_buffer.extend_from_slice(&packet_buffer[..offset]);
+                                            corruption_buffer
+                                                .extend_from_slice(&packet_buffer[..offset]);
 
                                             packet_buffer.copy_within(offset.., 0);
-                                            match port.read_exact(&mut packet_buffer[PACKET_TOTAL_SIZE - offset..]) {
+                                            match port.read_all(
+                                                &mut packet_buffer[PACKET_TOTAL_SIZE - offset..],
+                                            ) {
                                                 Ok(_) => {
                                                     match GtrPacket::from_bytes_with_error_correction(&packet_buffer) {
                                                         Ok(packet) => {
@@ -699,7 +799,10 @@ impl GtrSerialReader {
                                                     }
                                                 }
                                                 Err(_) => {
-                                                    corruption_buffer.extend_from_slice(&packet_buffer[..PACKET_TOTAL_SIZE - offset]);
+                                                    corruption_buffer.extend_from_slice(
+                                                        &packet_buffer
+                                                            [..PACKET_TOTAL_SIZE - offset],
+                                                    );
                                                     synced = false;
                                                     sync_buffer_idx = 0;
                                                     resync_attempts += 1;
@@ -717,19 +820,24 @@ impl GtrSerialReader {
                         }
 
                         if synced {
-                            match port.read_exact(&mut packet_buffer[..MAGIC_BYTES.len()]) {
+                            match port.read_all(&mut packet_buffer[..MAGIC_BYTES.len()]) {
                                 Ok(_) => {
                                     if packet_buffer[..MAGIC_BYTES.len()] != *MAGIC_BYTES {
-                                        let matching_bytes = packet_buffer[..MAGIC_BYTES.len()].iter()
+                                        let matching_bytes = packet_buffer[..MAGIC_BYTES.len()]
+                                            .iter()
                                             .zip(MAGIC_BYTES.iter())
                                             .filter(|&(a, b)| a == b)
                                             .count();
 
                                         if matching_bytes < 2 {
                                             debug!("Lost sync, resyncing");
-                                            corruption_buffer.extend_from_slice(&packet_buffer[..MAGIC_BYTES.len()]);
+                                            corruption_buffer.extend_from_slice(
+                                                &packet_buffer[..MAGIC_BYTES.len()],
+                                            );
                                             synced = false;
-                                            sync_buffer.copy_from_slice(&packet_buffer[..MAGIC_BYTES.len()]);
+                                            sync_buffer.copy_from_slice(
+                                                &packet_buffer[..MAGIC_BYTES.len()],
+                                            );
                                             sync_buffer_idx = 0;
                                             resync_attempts += 1;
                                         }
@@ -744,25 +852,11 @@ impl GtrSerialReader {
                             }
                         }
                     }
-                    Err(e) if e.kind() == io::ErrorKind::TimedOut => {
-                        skip_bytes += 1;
-                        if skip_bytes > 10 {
-                            debug!("Multiple timeouts, resyncing");
-                            synced = false;
-                            sync_buffer_idx = 0;
-                            skip_bytes = 0;
-                            resync_attempts += 1;
-                        }
-                        continue;
-                    }
                     Err(e) => {
                         error!("Serial error: {}", e);
                         synced = false;
                         sync_buffer_idx = 0;
                         resync_attempts += 1;
-                        if e.kind() == io::ErrorKind::BrokenPipe || e.kind() == io::ErrorKind::NotConnected {
-                            break;
-                        }
                     }
                 }
 
@@ -771,7 +865,12 @@ impl GtrSerialReader {
                     resync_attempts = 0;
                 }
             }
+
+            if stop_signal.load(Ordering::Relaxed) {
+                break;
+            }
         }
+        let _ = port.reset();
         info!("Reader thread finished");
     }
 
@@ -811,14 +910,17 @@ impl GtrSerialReader {
     pub fn stop(&mut self) -> Result<(), GtrError> {
         info!("Stopping GTR serial reader...");
         self.stop_signal.store(true, Ordering::Relaxed);
+
         if let Some(handle) = self.reader_thread.take() {
-            if handle.join().is_err() {
-                return Err(GtrError::ThreadComm(
-                    "Reader thread panicked".to_string(),
-                ));
+            let join_timeout = Duration::from_secs(1);
+
+            let join_handle = thread::spawn(move || handle.join());
+
+            if join_handle.join_timeout(join_timeout).is_err() {
+                warn!("Reader thread didn't exit cleanly within timeout");
             }
         }
-        info!("GTR serial reader stopped.");
+
         Ok(())
     }
 }
@@ -842,8 +944,14 @@ mod tests {
     fn test_parse() {
         let mut full_packet_data = Vec::new();
         full_packet_data.write_all(MAGIC_BYTES).unwrap();
-        full_packet_data.write_all(&[0x01, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x1B, 0x00, 0x00]).unwrap();
-        full_packet_data.write_all(&[0x00, 0b00111111, 0b11100000 | (8 << 1)]).unwrap();
+        full_packet_data
+            .write_all(&[
+                0x01, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x1B, 0x00, 0x00,
+            ])
+            .unwrap();
+        full_packet_data
+            .write_all(&[0x00, 0b00111111, 0b11100000 | (8 << 1)])
+            .unwrap();
         for i in 0..NUM_SENSORS {
             let cog_val = i as u32;
             let byte0 = 0b00000100 | ((cog_val >> 16) & 0b11) as u8;
